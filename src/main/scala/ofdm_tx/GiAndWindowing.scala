@@ -29,7 +29,7 @@ case class GiAndWindowing() extends Component {
 
   // 0.5 - 0.5*cos(36 degree) = 0.0955 ~= 1/8 + 1/16 +1/32
   // 0.5 - 0.5*cos(72 degree) ~= 0.096
-  require((windowLen % 2) == 0)
+  require((windowLen == 4) || (windowLen == 6))
 
   //  //order the output of FFT
   val memPreHalf = Mem(ComplexDataType(GlobalDefine().modulationDataOutWidth ), wordCount = (fftPoints/2))
@@ -49,13 +49,13 @@ case class GiAndWindowing() extends Component {
   )
   val memPreHalfOut = memPreHalf.readAsync(fsmCnt.resized)
   val memPostHalfOut = memPostHalf.readAsync(fsmCnt.resized)
-  val giOut = cloneOf(io.dataIn.data.bData)
-  val giOutZero = cloneOf(io.dataIn.data.bData)
-  val giOutValid = False
-  val giOutMuxCondition = fsmCnt(writeAddr.getWidth)
-  val giOutMux = Mux(giOutMuxCondition,memPostHalfOut,memPreHalfOut)
-  setValueAsZero(giOutZero)
-  giOut := Mux(giOutValid,giOutMux,giOutZero)
+  val reorderOut = cloneOf(io.dataIn.data.bData)
+  val reorderOutZero = cloneOf(io.dataIn.data.bData)
+  val reorderOutValid = Bool()
+  val reorderOutMuxCondition = fsmCnt(writeAddr.getWidth)
+  val reorderOutMux = Mux(reorderOutMuxCondition,memPostHalfOut,memPreHalfOut)
+  setValueAsZero(reorderOutZero)
+  reorderOut := Mux(reorderOutValid,reorderOutMux,reorderOutZero)
 
   val fsm = new StateMachine{
     val stateWrite : State = new State with EntryPoint {
@@ -64,13 +64,13 @@ case class GiAndWindowing() extends Component {
         when(io.dataIn.valid){
           fsmCnt := fsmCnt + 1
           when(fsmCnt === (fftPoints/2 -1)){
-            goto(stateOutputGP)
+            goto(stateOutputGI)
           }
         }
       }
     }
 
-    val stateOutputGP = new State{
+    val stateOutputGI = new State{
       onEntry{
         when(io.shortGp){
           fsmCnt := fftPoints - 8
@@ -79,7 +79,7 @@ case class GiAndWindowing() extends Component {
         }
       }
       whenIsActive{
-        giOutValid := True
+        reorderOutValid := True
         fsmCnt := fsmCnt + 1
         when(fsmCnt === (fftPoints-1)){
           goto(stateOutputData)
@@ -92,14 +92,56 @@ case class GiAndWindowing() extends Component {
         fsmCnt := 0
       }
       whenIsActive {
-        giOutValid := True
+        reorderOutValid := True
         fsmCnt := fsmCnt + 1
         when(fsmCnt === (fftPoints - 1)) {
+          goto(stateOutPutWindowing)
+        }
+      }
+    }
+
+    val stateOutPutWindowing = new State{
+      onEntry{
+        fsmCnt := 0
+      }
+      whenIsActive{
+        reorderOutValid := True
+        fsmCnt := fsmCnt + 1
+        when(fsmCnt === (windowLen - 1)) {
           goto(stateWrite)
         }
       }
     }
   }
+
+  reorderOutValid := Mux(fsm.isActive(fsm.stateWrite), False, True)
+
+  //implement windowing, use delay chain to implement.
+  val windowingReg = Vec.fill(windowLen)(cloneOf(reorderOut))
+  val windowingZero = cloneOf(reorderOut)
+  val windowingMuxInput = cloneOf(reorderOut)
+  val windowingRegEn = False
+  setValueAsZero(windowingZero)
+  windowingMuxInput := Mux(fsm.isActive(fsm.stateOutPutWindowing), reorderOut, windowingZero)
+
+  when(windowingRegEn){
+    for(index <- 1 until windowLen){
+      windowingReg(index) := windowingReg(index-1)
+    }
+    windowingReg(0) := windowingMuxInput
+  }
+
+  windowingReg.foreach(initRegFunc)
+  when(io.newPackage){
+    windowingReg.foreach(setValueAsZero)
+  }otherwise{
+    when(fsm.isActive(fsm.stateOutputGI) || fsm.isActive(fsm.stateOutPutWindowing)){
+      windowingRegEn := True
+    }
+  }
+
+  // mixing the
+
 }
 
 /*

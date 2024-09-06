@@ -86,8 +86,8 @@ case class OfdmTx(DataInWidth : Int, DacWidth : Int) extends Component{
   ifftModule.io.dataIn <> pilotInsertModule.io.dataOut
 
   //instantiate GpAndWindowing
-  val gpAndWindowing = GiAndWindowing()
-  gpAndWindowing.io.dataIn <> ifftModule.io.dataOut
+  val giAndWindowing = GiAndWindowing()
+  giAndWindowing.io.dataIn <> ifftModule.io.dataOut
 }
 
 
