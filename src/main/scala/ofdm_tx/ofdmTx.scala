@@ -83,10 +83,11 @@ case class OfdmTx(DataInWidth : Int, DacWidth : Int) extends Component{
 
   //instantiate IFFT
   val ifftModule = FftByCsgRadix2(64, GlobalDefine().modulationDataOutWidth, GlobalDefine().rotationFactorWidth, forFFT = false)
-  ifftModule.io.dataIn := pilotInsertModule.io.dataOut
+  ifftModule.io.dataIn <> pilotInsertModule.io.dataOut
 
-
-
+  //instantiate GpAndWindowing
+  val gpAndWindowing = GiAndWindowing()
+  gpAndWindowing.io.dataIn <> ifftModule.io.dataOut
 }
 
 

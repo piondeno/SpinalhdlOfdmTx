@@ -1,5 +1,6 @@
 package ofdm_tx
 
+import ofdm_tx.ButterflyDataIf.initNullFunc
 import spinal.core._
 import spinal.lib._
 import spinal.core.sim._
@@ -39,6 +40,10 @@ object ButterflyDataIf{
 
   // do not thing for initialization is not needed
   def initNullFunc(x: ButterflyDataIf): Unit = {
+    x.aData.I := 0
+    x.aData.Q := 0
+    x.bData.I := 0
+    x.bData.Q := 0
   }
 }
 
@@ -408,13 +413,13 @@ case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFact
   require(numStageCombined >= 2)
 
   val io = new Bundle{
-//    val dataIn = slave(Stream(CsgFftDataIf(inputDataWidth)))
-//    val dataOut = master(Stream(CsgFftDataIf(inputDataWidth+numStageCombined)))
-//      val dataIn = in(FftDataOutIf(inputDataWidth))
       val dataIn = slave(Stream(ButterflyDataIf(inputDataWidth)))
-      val dataOut = slave(Stream(ButterflyDataIf(inputDataWidth+numStageCombined)))
+      val dataOut = master(Stream(ButterflyDataIf(inputDataWidth+numStageCombined)))
   }
 
+  //default input signal declare here to avoid errors
+
+  //If there are multi-stages be combined in this module, it is used to control the coee ROM
   val csgProgress = Reg(B(1, numStageCombined - 1 bits)) //this signal will be used to mask addr signal of coee ROM
 
   //expand dataIn width
@@ -433,7 +438,7 @@ case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFact
   butterfly2Inst.io.rotationFactor := fftCoeeRomInst.io.dataOut
   fftCoeeRomInst.io.addr := fftCoeeRomInstAddr
 
-  //the val in fsm
+  //the val be used in fsm
   val validTiming = False
   val fsmCnt = Reg(UInt((fftPower - 1) bits)) init (0)
   var dumpWidth = fftCoeeRomInstAddr.getWidth - csgProgress.getWidth
@@ -460,7 +465,7 @@ case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFact
   println("butterflyDelayValue : " + butterflyDelayValue)
 
   val fftAddr_Reg = Reg(Vec.fill(butterflyDelayValue)(cloneOf(fsmCnt)))
-  val validTimingReg = Reg(Vec.fill(butterflyDelayValue)(Bool()))
+  val validTimingReg = Reg(Vec.fill(butterflyDelayValue)(Bool())) //pipeline timing control, delay chain
   for(index <- 0 until validTimingReg.length){
     validTimingReg(index) init(False)
   }
@@ -493,7 +498,7 @@ case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFact
         fsmCnt := 0
       }
       whenIsActive{
-        validTiming := io.dataIn.valid
+        validTiming := io.dataIn.fire
         when(validTiming){
           when(fsmCnt === (fftPoints / 2 - 1)) {
             csgProgress := csgProgress |<< 1
@@ -533,6 +538,9 @@ case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFact
     }
   }
 
+  //
+  io.dataIn.ready := Mux(fsm.isActive(fsm.stateInput),True,False)
+
   //announce signals
   val loopFifoPopDataMux = cloneOf(loopFifoEven.io.popData)
   val loopFifoPopDataAddr = UInt(fsmCnt.getBitsWidth bits)
@@ -543,8 +551,11 @@ case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFact
   val outputEnable = Reg(Bool()) init(False)
   io.dataOut.valid := outputEnable
 
+  val zeroOut = ButterflyDataIf(inputDataWidth+numStageCombined)
+  initNullFunc(zeroOut)
+
   if(finalStageCheck){ //It will output signals without ready signal confirm. Beware...
-    io.dataOut.data := butterfly2Inst.io.dataOut
+    io.dataOut.payload := Mux(io.dataOut.valid, butterfly2Inst.io.dataOut, zeroOut)
     loopFifoPopDataAddr := fsmCnt
 
     when(fsm.isActive(fsm.stateOutput) && (fftAddr_Reg(fftAddr_Reg.length-1)===(fftPoints / 2 - 1)) && validTimingReg(validTimingReg.length-1) ){
@@ -556,7 +567,7 @@ case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFact
     val outputCnt = Reg(UInt(fsmCnt.getBitsWidth bits)) init(0)
     outputCnt.setName("outputCnt")
     println("fsmCnt : "+fsmCnt)
-    io.dataOut.data := loopFifoPopDataMux
+    io.dataOut.payload := Mux(io.dataOut.valid,loopFifoPopDataMux,zeroOut)
 
     loopFifoPopDataAddr := outputEnable ? outputCnt | fsmCnt
 
@@ -632,7 +643,7 @@ case class FftByCsgRadix2(fftPoints : Int, inputDataWidth : Int , rotationFactor
   }
 
   for(index <- 0 until fftStages.length-1){
-    fftStages(index+1).io.dataIn := fftStages(index).io.dataOut
+    fftStages(index+1).io.dataIn <> fftStages(index).io.dataOut
   }
   fftStages(0).io.dataIn <> io.dataIn
   //io.dataOut <> fftStage(fftStage.length-1).io.dataOut
@@ -644,70 +655,14 @@ case class FftByCsgRadix2(fftPoints : Int, inputDataWidth : Int , rotationFactor
     validOutputWidth = inputDataWidth + 4
     println("validoutputWidth : "+validOutputWidth)
   }
-  require(fftStages(fftStages.length-1).io.dataOut.data.aData.I.getBitsWidth >=  validOutputWidth)
-  println("fftStage(fftStages.length - 1).io.dataOut.data.aData.I((validoutputWidth - 1) downto (validoutputWidth - 1 - (inputDataWidth - 1)))"+fftStages(fftStages.length - 1).io.dataOut.data.aData.I((validOutputWidth - 1) downto (validOutputWidth - 1 - (inputDataWidth - 1))))
+  require(fftStages(fftStages.length-1).io.dataOut.aData.I.getBitsWidth >=  validOutputWidth)
+  println("fftStage(fftStages.length - 1).io.dataOut.data.aData.I((validoutputWidth - 1) downto (validoutputWidth - 1 - (inputDataWidth - 1)))"+fftStages(fftStages.length - 1).io.dataOut.aData.I((validOutputWidth - 1) downto (validOutputWidth - 1 - (inputDataWidth - 1))))
 
-  io.dataOut.data.aData.I := fftStages(fftStages.length - 1).io.dataOut.data.aData.I((validOutputWidth - 1) downto (validOutputWidth - 1 - (inputDataWidth - 1)))
-  io.dataOut.data.aData.Q := fftStages(fftStages.length - 1).io.dataOut.data.aData.Q((validOutputWidth - 1) downto (validOutputWidth - 1 - (inputDataWidth - 1)))
-  io.dataOut.data.bData.I := fftStages(fftStages.length - 1).io.dataOut.data.bData.I((validOutputWidth - 1) downto (validOutputWidth - 1 - (inputDataWidth - 1)))
-  io.dataOut.data.bData.Q := fftStages(fftStages.length - 1).io.dataOut.data.bData.Q((validOutputWidth - 1) downto (validOutputWidth - 1 - (inputDataWidth - 1)))
+  io.dataOut.data.aData.I := fftStages(fftStages.length - 1).io.dataOut.aData.I((validOutputWidth - 1) downto (validOutputWidth - 1 - (inputDataWidth - 1)))
+  io.dataOut.data.aData.Q := fftStages(fftStages.length - 1).io.dataOut.aData.Q((validOutputWidth - 1) downto (validOutputWidth - 1 - (inputDataWidth - 1)))
+  io.dataOut.data.bData.I := fftStages(fftStages.length - 1).io.dataOut.bData.I((validOutputWidth - 1) downto (validOutputWidth - 1 - (inputDataWidth - 1)))
+  io.dataOut.data.bData.Q := fftStages(fftStages.length - 1).io.dataOut.bData.Q((validOutputWidth - 1) downto (validOutputWidth - 1 - (inputDataWidth - 1)))
   io.dataOut.valid := fftStages(fftStages.length - 1).io.dataOut.valid
-
-//  //order the output of FFT
-//  val memPreHalf = Mem(ComplexDataType(inputDataWidth ), wordCount = (fftPoints/2))
-//  val memPostHalf = Mem(ComplexDataType(inputDataWidth), wordCount = (fftPoints/2))
-//  val fsmCnt = Reg(UInt(log2Up(fftPoints/2) bits)) init(0)
-//  val dataValid = fftStage(fftStage.length - 1).io.dataOut.valid
-//  val writeAddr = fsmCnt.reversed
-//  memPreHalf.write(
-//    enable = dataValid,
-//    address = writeAddr,
-//    data = fftOutputBeforeOrder.aData
-//  )
-//  memPostHalf.write(
-//    enable = dataValid,
-//    address = writeAddr,
-//    data = fftOutputBeforeOrder.bData
-//  )
-//  val memPreHalfOut = memPreHalf.readAsync(fsmCnt)
-//  val memPostHalfOut = memPostHalf.readAsync(fsmCnt)
-//
-//  val fsm = new StateMachine{
-//    val stateWrite : State = new State with EntryPoint {
-//      whenIsActive{
-//        when(dataValid){
-//          fsmCnt := fsmCnt + 1
-//          when(fsmCnt === (fftPoints/2 -1)){
-//            goto(stateOutputPreHalf)
-//          }
-//        }
-//      }
-//    }
-//
-//    val stateOutputPreHalf : State = new State{
-//      whenIsActive{
-//        io.dataOut.valid := True
-//        fsmCnt := fsmCnt + 1
-//        io.dataOut.data := memPreHalfOut
-//        when(fsmCnt === (fftPoints / 2 - 1)) {
-//          goto(stateOutputPostHalf)
-//        }
-//      }
-//    }
-//
-//    val stateOutputPostHalf: State = new State {
-//      whenIsActive {
-//        io.dataOut.valid := True
-//        fsmCnt := fsmCnt + 1
-//        io.dataOut.data := memPostHalfOut
-//        when(fsmCnt === (fftPoints / 2 - 1)) {
-//          goto(stateWrite)
-//        }
-//      }
-//    }
-//
-//  }
-
 }
 
 case class FftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFactorWidth : Int, stagePlan : Int) extends Component{
@@ -905,10 +860,10 @@ object fftRadix2StageSim {
 
     else if(false){
       SimConfig.withWave.doSim(CsgFftRadix2Stage(64, 16, 18, 1, 3, false)) { dut =>
-        dut.io.dataIn.data.aData.I #= 100
-        dut.io.dataIn.data.aData.Q #= 200
-        dut.io.dataIn.data.bData.I #= 300
-        dut.io.dataIn.data.bData.Q #= 400
+        dut.io.dataIn.aData.I #= 100
+        dut.io.dataIn.aData.Q #= 200
+        dut.io.dataIn.bData.I #= 300
+        dut.io.dataIn.bData.Q #= 400
         dut.clockDomain.forkStimulus(period = 10)
         dut.clockDomain.assertReset()
         dut.clockDomain.waitSampling(10)
@@ -996,10 +951,10 @@ object fftRadix2StageSim {
 
         dut.io.dataIn.valid #= true
         for(index <- 0 until 32){
-          dut.io.dataIn.data.aData.I #= dataInRe(index)
-          dut.io.dataIn.data.aData.Q #= dataInIm(index)
-          dut.io.dataIn.data.bData.I #= dataInRe(index+32)
-          dut.io.dataIn.data.bData.Q #= dataInIm(index+32)
+          dut.io.dataIn.aData.I #= dataInRe(index)
+          dut.io.dataIn.aData.Q #= dataInIm(index)
+          dut.io.dataIn.bData.I #= dataInRe(index+32)
+          dut.io.dataIn.bData.Q #= dataInIm(index+32)
           dut.clockDomain.waitSampling(1)
         }
         dut.io.dataIn.valid #= false

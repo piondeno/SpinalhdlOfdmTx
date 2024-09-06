@@ -8,8 +8,7 @@ import spinal.lib.fsm._
 case class PilotInsert() extends Component{
   val io = new Bundle{
     val dataIn = slave(Stream(PunctInterleaverDataOutIF()))
-    //val dataOut = master(Stream(CsgFftDataIf(GlobalDefine().modulationDataOutWidth) ))
-    val dataOut = out(FftDataIf(GlobalDefine().modulationDataOutWidth))
+    val dataOut = master(Stream(ButterflyDataIf(GlobalDefine().modulationDataOutWidth) ))
     val newPackage = out(Bool())
   }
 
@@ -35,12 +34,22 @@ case class PilotInsert() extends Component{
   val pilotTiming = Bool()   // the time for insert pilot
   val inputPreHalfValidTiming = io.dataIn.fire || pilotTiming
 
-  when(io.dataIn.fire){
-    pilotInsertCnt := pilotInsertCnt + 1
-  } elsewhen (pilotInsertCnt === 57){
-    pilotInsertCnt := 0
-  } elsewhen(pilotInsertCnt =/= 0){
-    pilotInsertCnt := pilotInsertCnt + 1
+  // 57=63-6
+  // 請參考 google driver 的 pilotLocation檔案內的pilotInsertCnt欄位
+  // 前26點 {data(24) + pilot(2)}不用考慮dataOut的ready信號，這些資料會先填充到dataInReg
+  // 後32點就必須根據等待dataOut的ready信號
+  when(pilotInsertCnt < 26){
+    when(inputPreHalfValidTiming){
+      pilotInsertCnt := pilotInsertCnt + 1
+    }
+  } otherwise{
+    when(io.dataOut.fire){
+      when(pilotInsertCnt === 57){
+        pilotInsertCnt := 0
+      } otherwise{
+        pilotInsertCnt := pilotInsertCnt + 1
+      }
+    }
   }
 
   when(pushEnable ){
@@ -64,7 +73,7 @@ case class PilotInsert() extends Component{
   // pilotInsertCnt : 0 ~ 25, input preHalf data into dataInReg
   // pilotInsertCnt : 26 ~ 31, lower path only output null tone.
   // pilotInsertCnt : 32 ~ 63, output lower path data from dataInReg
-  pushEnable := ((pilotInsertCnt < 26) && inputPreHalfValidTiming) || (pilotInsertCnt >31 ) // index : 26 ~ 32, lower path only output null tone.
+  pushEnable := ((pilotInsertCnt < 26) && inputPreHalfValidTiming) || ((pilotInsertCnt >31) && io.dataOut.fire ) // index : 26 ~ 32, lower path only output null tone.
   pilotTiming := (pilotInsertCnt === 5) || (pilotInsertCnt === 19) || (pilotInsertCnt === 33) || (pilotInsertCnt === 47)
 
   when(pilotTiming) {
@@ -81,6 +90,7 @@ case class PilotInsert() extends Component{
   }
 
   //io.dataIn.ready control
+  //pilotInsertCnt==26 is DC
   val dataInReadyCtrl = False
   when(pilotInsertCnt < 26){
     dataInReadyCtrl := True
@@ -93,16 +103,16 @@ case class PilotInsert() extends Component{
   io.dataOut.valid := Mux((pilotInsertCnt>25),True,False)
 
   //io.dataOut control
-  io.dataOut.data.aData.I := 0
-  io.dataOut.data.aData.Q := 0
-  io.dataOut.data.bData.I := 0
-  io.dataOut.data.bData.Q := 0
+  io.dataOut.aData.I := 0
+  io.dataOut.aData.Q := 0
+  io.dataOut.bData.I := 0
+  io.dataOut.bData.Q := 0
 
   when(pilotInsertCnt > 31){
-    io.dataOut.data.bData := dataInReg(dataInReg.length-1)
+    io.dataOut.bData := dataInReg(dataInReg.length-1)
   }
   when((pilotInsertCnt > 26) && (pilotInsertCnt < 53) ){
-    io.dataOut.data.aData := modulator.io.dataOut
+    io.dataOut.aData := modulator.io.dataOut
   }
 }
 
