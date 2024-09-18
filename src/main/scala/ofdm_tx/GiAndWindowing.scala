@@ -1,5 +1,6 @@
 package ofdm_tx
 
+import ofdm_tx.ButterflyDataIf.initNullFunc
 import ofdm_tx.ComplexDataType.{initRegFunc, setValueAsZero}
 import spinal.core._
 import spinal.lib._
@@ -24,12 +25,12 @@ case class GiAndWindowing() extends Component {
 
   val fftPoints = GlobalDefine().fftPoints
   val giLen = 16 // 64/4=16 for normal GI, short GI only 8 points
-  val windowLen = 4
+  val windowLen = 5
   val fsmCnt = Reg(UInt(log2Up(fftPoints + giLen + windowLen) bits)) init(0)
 
   // 0.5 - 0.5*cos(36 degree) = 0.0955 ~= 1/8 + 1/16 +1/32
   // 0.5 - 0.5*cos(72 degree) ~= 0.096
-  require((windowLen == 4) || (windowLen == 6))
+  require((windowLen == 4) || (windowLen == 5) || (windowLen == 6))
 
   //  //order the output of FFT
   val memPreHalf = Mem(ComplexDataType(GlobalDefine().modulationDataOutWidth ), wordCount = (fftPoints/2))
@@ -64,13 +65,15 @@ case class GiAndWindowing() extends Component {
         when(io.dataIn.valid){
           fsmCnt := fsmCnt + 1
           when(fsmCnt === (fftPoints/2 -1)){
-            goto(stateOutputGI)
+            goto(stateOutputGiWindowOverlap)
           }
         }
       }
     }
 
-    val stateOutputGI = new State{
+    val stateOutputGiWindowOverlap = new State{
+      val endTiming = Mux(io.shortGp, U(fftPoints - 8 + windowLen -1, fsmCnt.getWidth bits), U(fftPoints - 16 + windowLen -1, fsmCnt.getWidth bits) )
+
       onEntry{
         when(io.shortGp){
           fsmCnt := fftPoints - 8
@@ -78,6 +81,16 @@ case class GiAndWindowing() extends Component {
           fsmCnt := fftPoints - 16
         }
       }
+      whenIsActive{
+        reorderOutValid := True
+        fsmCnt := fsmCnt + 1
+        when(fsmCnt === endTiming){
+          goto(stateOutputGi)
+        }
+      }
+    }
+
+    val stateOutputGi = new State{
       whenIsActive{
         reorderOutValid := True
         fsmCnt := fsmCnt + 1
@@ -95,12 +108,12 @@ case class GiAndWindowing() extends Component {
         reorderOutValid := True
         fsmCnt := fsmCnt + 1
         when(fsmCnt === (fftPoints - 1)) {
-          goto(stateOutPutWindowing)
+          goto(stateOutputWindowing)
         }
       }
     }
 
-    val stateOutPutWindowing = new State{
+    val stateOutputWindowing = new State{
       onEntry{
         fsmCnt := 0
       }
@@ -121,8 +134,9 @@ case class GiAndWindowing() extends Component {
   val windowingZero = cloneOf(reorderOut)
   val windowingMuxInput = cloneOf(reorderOut)
   val windowingRegEn = False
+  val windowAdderOut = cloneOf(reorderOut)
   setValueAsZero(windowingZero)
-  windowingMuxInput := Mux(fsm.isActive(fsm.stateOutPutWindowing), reorderOut, windowingZero)
+  windowingMuxInput := Mux(fsm.isActive(fsm.stateOutputWindowing), windowAdderOut, windowingZero)
 
   when(windowingRegEn){
     for(index <- 1 until windowLen){
@@ -135,239 +149,229 @@ case class GiAndWindowing() extends Component {
   when(io.newPackage){
     windowingReg.foreach(setValueAsZero)
   }otherwise{
-    when(fsm.isActive(fsm.stateOutputGI) || fsm.isActive(fsm.stateOutPutWindowing)){
+    when(fsm.isActive(fsm.stateOutputGiWindowOverlap) || fsm.isActive(fsm.stateOutputWindowing)){
       windowingRegEn := True
     }
   }
 
-  // mixing the
+  // The overlap timing of GI and Windowing
+  val windowingCnt = Reg(UInt(windowLen bits)) init(0)
+  val timingOverlapGiWindow = fsm.isActive(fsm.stateOutputGiWindowOverlap)
+  val dataInDivBy2_I = reorderOut.I |>> 1
+  val dataInDivBy2_Q = reorderOut.Q |>> 1
+  val dataInDivBy4_I = reorderOut.I >> 2
+  val dataInDivBy4_Q = reorderOut.Q >> 2
+  val dataInDivBy4_I2SC = (~dataInDivBy4_I + 1)
+  val dataInDivBy4_Q2SC = (~dataInDivBy4_Q + 1)
+  val dataInDivBy16_I = reorderOut.I >> 4
+  val dataInDivBy16_Q = reorderOut.Q >> 4
+  val dataInDivBy16_I2SC = (~dataInDivBy16_I + 1)
+  val dataInDivBy16_Q2SC = (~dataInDivBy16_Q + 1)
+
+  val windowAdderInputZero = cloneOf(reorderOut)
+  setValueAsZero(windowAdderInputZero)
+  val windowAdderInput = ButterflyDataIf(reorderOut.I.getBitsWidth)
+  val overlapOutput = cloneOf(reorderOut)
+  val finalOutput = Reg(cloneOf(reorderOut))
+  println("windowAdderInput.aData.I + windowAdderInput.bData.I len = " + (windowAdderInput.aData.I + windowAdderInput.bData.I).getWidth)
+  windowAdderOut.I := windowAdderInput.aData.I + windowAdderInput.bData.I
+  windowAdderOut.Q := windowAdderInput.aData.Q + windowAdderInput.bData.Q
+
+  when(fsm.isActive(fsm.stateOutputGiWindowOverlap) || fsm.isActive(fsm.stateOutputWindowing)){
+    windowingCnt := windowingCnt + 1
+  } otherwise{
+    windowingCnt := 0
+  }
+
+  overlapOutput.I := windowAdderOut.I + windowingReg(windowingReg.length-1).I
+  overlapOutput.Q := windowAdderOut.Q + windowingReg(windowingReg.length-1).Q
+
+  when(fsm.isActive(fsm.stateOutputGiWindowOverlap)) {
+    finalOutput := overlapOutput
+  } elsewhen(fsm.isActive(fsm.stateOutputGi) || fsm.isActive(fsm.stateOutputData)){
+    finalOutput := reorderOut
+  } otherwise{
+    finalOutput := windowAdderInputZero
+  }
+
+  when(fsm.isActive(fsm.stateOutputGiWindowOverlap)){
+    switch(windowingCnt){
+      is(0){
+        windowAdderInput.aData := windowAdderInputZero
+        windowAdderInput.bData.I := dataInDivBy16_I.resized
+        windowAdderInput.bData.Q := dataInDivBy16_Q.resized
+      }
+      is(1) {
+        windowAdderInput.aData := windowAdderInputZero
+        windowAdderInput.bData.I := dataInDivBy4_I.resized
+        windowAdderInput.bData.Q := dataInDivBy4_Q.resized
+      }
+      is(2) {
+        windowAdderInput.aData := windowAdderInputZero
+        windowAdderInput.bData.I := dataInDivBy2_I.resized
+        windowAdderInput.bData.Q := dataInDivBy2_Q.resized
+      }
+      is(3) {
+        windowAdderInput.aData := reorderOut
+        windowAdderInput.bData.I := dataInDivBy4_I2SC.resized
+        windowAdderInput.bData.Q := dataInDivBy4_Q2SC.resized
+      }
+      default{
+        windowAdderInput.aData := reorderOut
+        windowAdderInput.bData.I := dataInDivBy16_I2SC.resized
+        windowAdderInput.bData.Q := dataInDivBy16_Q2SC.resized
+      }
+    }
+  } elsewhen(fsm.isActive(fsm.stateOutputWindowing)){
+    switch(windowingCnt) {
+      is(4) {
+        windowAdderInput.aData := windowAdderInputZero
+        windowAdderInput.bData.I := dataInDivBy16_I.resized
+        windowAdderInput.bData.Q := dataInDivBy16_Q.resized
+      }
+      is(3) {
+        windowAdderInput.aData := windowAdderInputZero
+        windowAdderInput.bData.I := dataInDivBy4_I.resized
+        windowAdderInput.bData.Q := dataInDivBy4_Q.resized
+      }
+      is(2) {
+        windowAdderInput.aData := windowAdderInputZero
+        windowAdderInput.bData.I := dataInDivBy2_I.resized
+        windowAdderInput.bData.Q := dataInDivBy2_Q.resized
+      }
+      is(1) {
+        windowAdderInput.aData := reorderOut
+        windowAdderInput.bData.I := dataInDivBy4_I2SC.resized
+        windowAdderInput.bData.Q := dataInDivBy4_Q2SC.resized
+      }
+      default {
+        windowAdderInput.aData := reorderOut
+        windowAdderInput.bData.I := dataInDivBy16_I2SC.resized
+        windowAdderInput.bData.Q := dataInDivBy16_Q2SC.resized
+      }
+    }
+  } otherwise {
+    windowAdderInput.aData := windowAdderInputZero
+    windowAdderInput.bData := windowAdderInputZero
+  }
+
 
 }
 
-/*
-case class GpAndWindowing() extends Component{
-  val io = new Bundle{
+case class reorderIfftAndAddGiDataOutIF(width : Int) extends Bundle{
+  val data = ComplexDataType(width)
+  val valid = Bool()
+}
+
+case class ReorderIfftAndAddGi() extends Component {
+  val io = new Bundle {
     val dataIn = in(FftDataOutIf(GlobalDefine().modulationDataOutWidth))
-    val newPackage = in(Bool())
-    val shortGp = in(Bool())
-    val dataOut = out(FftDataOutIf(GlobalDefine().modulationDataOutWidth))
+    val giTypeIn = in(UInt(GlobalDefine().giTypeWidth bits))
+    val dataOut = master(Flow(ComplexDataType(GlobalDefine().modulationDataOutWidth)))
+  }
+
+  // giTypeIn
+  val giTypeInReg = Reg(cloneOf(io.giTypeIn)) init(GlobalDefine().ltfGiType)
+  when(io.dataIn.valid.rise()){
+    giTypeInReg := io.giTypeIn
   }
 
   val fftPoints = GlobalDefine().fftPoints
-  val gpLen = 16 // 64/4=16 for normal GP, short GP only 8 points
-  val windowLen = 4
-  val fsmCnt = Reg(UInt(log2Up(fftPoints+gpLen+windowLen) bits))
+  val fsmCnt = Reg(UInt(log2Up(fftPoints) bits)) init(0)
 
-  // 0.5 - 0.5*cos(36 degree) = 0.0955 ~= 1/8 + 1/16 +1/32
-  // 0.5 - 0.5*cos(72 degree) ~= 0.096
-  require((windowLen%2) == 0)
+  //  //order the output of FFT
+  val memPreHalf = Mem(ComplexDataType(GlobalDefine().modulationDataOutWidth ), wordCount = (fftPoints/2))
+  val memPostHalf = Mem(ComplexDataType(GlobalDefine().modulationDataOutWidth), wordCount = (fftPoints/2))
+  val writeAddr = UInt(log2Up(fftPoints/2) bits)
 
-  //state machine
+  writeAddr :=  fsmCnt.resize(writeAddr.getWidth).reversed
+  memPreHalf.write(
+    enable = io.dataIn.valid,
+    address = writeAddr,
+    data = io.dataIn.data.aData
+  )
+  memPostHalf.write(
+    enable = io.dataIn.valid,
+    address = writeAddr,
+    data = io.dataIn.data.bData
+  )
+  val memPreHalfOut = memPreHalf.readAsync(fsmCnt.resized)
+  val memPostHalfOut = memPostHalf.readAsync(fsmCnt.resized)
+  val reorderOut = cloneOf(io.dataIn.data.bData)
+  val reorderOutZero = cloneOf(io.dataIn.data.bData)
+  val reorderOutValid = Bool()
+  val reorderOutMuxCondition = fsmCnt(writeAddr.getWidth)
+  val reorderOutMux = Mux(reorderOutMuxCondition,memPostHalfOut,memPreHalfOut)
+  setValueAsZero(reorderOutZero)
+  reorderOut := Mux(reorderOutValid,reorderOutMux,reorderOutZero)
+
+  val giInitVal = cloneOf(fsmCnt)
+  switch(giTypeInReg){
+    is(GlobalDefine().ltfGiType){
+      giInitVal := fftPoints - 32
+    }
+    is(GlobalDefine().shortGiType){
+      giInitVal := fftPoints - 8
+    }
+    default{
+      giInitVal := fftPoints - 16
+    }
+  }
+
   val fsm = new StateMachine{
-
-    val statePreHalfWindow : State = new State with EntryPoint {
-      onEntry( fsmCnt := 0)
+    val stateWrite : State = new State with EntryPoint {
+      onEntry(fsmCnt := 0)
       whenIsActive{
         when(io.dataIn.valid){
           fsmCnt := fsmCnt + 1
-        }
-        when( fsmCnt === (windowLen-1) ){
-          goto(stateGpDataIn)
-        }
-      }
-    }
-
-    val stateGpDataIn = new State{
-      whenIsActive{
-        when(io.dataIn.valid) {
-          fsmCnt := fsmCnt + 1
-        }
-        when(fsmCnt === (windowLen + gpLen - 1)) {
-          goto(stateDataOut)
+          when(fsmCnt === (fftPoints/2 -1)){
+            goto(stateOutputGi)
+          }
         }
       }
     }
 
-    val stateDataOut = new State{
-      whenIsActive{
-        when(io.dataIn.valid) {
-          fsmCnt := fsmCnt + 1
-        }
-        when(fsmCnt === (fftPoints - 1)) {
-          goto(stateGpDataOut)
-        }
+    val stateOutputGi = new State{
+      onEntry{
+        fsmCnt := giInitVal
       }
-    }
-
-    val stateGpDataOut = new State{
       whenIsActive{
+        reorderOutValid := True
         fsmCnt := fsmCnt + 1
-        when(fsmCnt === (fftPoints+gpLen-1)){
-          goto(statePreHalfWindow)
+        when(fsmCnt === (fftPoints-1)){
+          goto(stateOutputData)
         }
       }
     }
+
+    val stateOutputData = new State {
+      whenIsActive {
+        reorderOutValid := True
+        fsmCnt := fsmCnt + 1
+        when(fsmCnt === (fftPoints - 1)) {
+          when(giTypeInReg === GlobalDefine().ltfGiType){
+            goto(stateOutputDataRepeat)
+          } otherwise{
+            goto(stateWrite)
+          }
+        }
+      }
+    }
+
+    val stateOutputDataRepeat = new State {
+      whenIsActive {
+        reorderOutValid := True
+        fsmCnt := fsmCnt + 1
+        when(fsmCnt === (fftPoints - 1)) {
+          goto(stateWrite)
+        }
+      }
+    }
+
   }
 
-  val gpReg = Vec.fill(gpLen + windowLen)(cloneOf(io.dataIn.data))
-  gpReg.foreach(initRegFunc)
-  when(io.newPackage) { //clean content for first symbol
-    for (index <- 0 until gpReg.length) {
-      gpReg(index).I := 0
-      gpReg(index).Q := 0
-    }
-  } elsewhen (io.dataIn.valid && (fsmCnt < (gpLen + windowLen))) {
-    gpReg(0) := io.dataIn.data
-    for (index <- 1 until gpReg.length) {
-      gpReg(index) := gpReg(index - 1)
-    }
-  } elsewhen(fsm.isActive(fsm.stateGpDataOut)) {
-    gpReg(0).I := 0
-    gpReg(0).Q := 0
-    for (index <- 1 until gpReg.length) {
-      gpReg(index) := gpReg(index - 1)
-    }
-  }
-
-  // Windowing
-  val gpOutValid = fsm.isActive(fsm.stateGpDataOut)
-  val dataInReg = RegNext(io.dataIn.data)
-  val currentSymbolAdderIn_I = Vec.fill(windowLen)(cloneOf(io.dataIn.data.I))
-  val currentSymbolAdderIn_Q = Vec.fill(windowLen)(cloneOf(io.dataIn.data.I))
-  val currentSymbolAdderOut = cloneOf(io.dataIn.data)
-  val previousSymbolAdderIn_I = Vec.fill(windowLen)(cloneOf(io.dataIn.data.I))
-  val previousSymbolAdderIn_Q = Vec.fill(windowLen)(cloneOf(io.dataIn.data.I))
-  val previousSymbolAdderOut = cloneOf(io.dataIn.data)
-  val windowingOut = Reg(cloneOf(io.dataIn.data))
-
-  if(windowLen == 4){ //currentSymbol control
-    val currentSymbolMiddleAdder_I = Vec.fill(windowLen/2)(Reg(cloneOf(io.dataIn.data.I)))
-    val currentSymbolMiddleAdder_Q = Vec.fill(windowLen/2)(Reg(cloneOf(io.dataIn.data.I)))
-    val previousSymbolMiddleAdder_I = Vec.fill(windowLen/2)(Reg(cloneOf(io.dataIn.data.I)))
-    val previousSymbolMiddleAdder_Q = Vec.fill(windowLen/2)(Reg(cloneOf(io.dataIn.data.I)))
-
-    for(index <- 0 until currentSymbolMiddleAdder_I.length){
-      currentSymbolMiddleAdder_I(index) := currentSymbolAdderIn_I(index*(windowLen/2)) + currentSymbolAdderIn_I(index*(windowLen/2)+1)
-      currentSymbolMiddleAdder_Q(index) := currentSymbolAdderIn_Q(index*(windowLen/2)) + currentSymbolAdderIn_Q(index*(windowLen/2)+1)
-      previousSymbolMiddleAdder_I(index) := previousSymbolAdderIn_I(index * (windowLen / 2)) + previousSymbolAdderIn_I(index * (windowLen / 2) + 1)
-      previousSymbolMiddleAdder_Q(index) := previousSymbolAdderIn_Q(index * (windowLen / 2)) + previousSymbolAdderIn_Q(index * (windowLen / 2) + 1)
-    }
-
-    currentSymbolAdderOut.I := currentSymbolMiddleAdder_I(0) + currentSymbolMiddleAdder_I(1)
-    currentSymbolAdderOut.Q := currentSymbolMiddleAdder_Q(0) + currentSymbolMiddleAdder_Q(1)
-    previousSymbolAdderOut.I := previousSymbolMiddleAdder_I(0) + previousSymbolMiddleAdder_I(1)
-    previousSymbolAdderOut.Q := previousSymbolMiddleAdder_Q(0) + previousSymbolMiddleAdder_Q(1)
-    windowingOut.I := currentSymbolAdderOut.I + previousSymbolAdderOut.I
-    windowingOut.Q := currentSymbolAdderOut.Q + previousSymbolAdderOut.Q
-
-    when(fsm.isActive(fsm.statePreHalfWindow)){
-      switch(fsmCnt(1 downto 0)){
-        is(0){ //0.0955 for currentSymbol, 0.9045 for previousSymbol
-          currentSymbolAdderIn_I(0) := io.dataIn.data.I |>> 5 // divid by 32
-          currentSymbolAdderIn_Q(0) := io.dataIn.data.Q |>> 5
-          currentSymbolAdderIn_I(1) := io.dataIn.data.I |>> 4 // divid by 16
-          currentSymbolAdderIn_Q(1) := io.dataIn.data.Q |>> 4
-          currentSymbolAdderIn_I(2) := 0
-          currentSymbolAdderIn_Q(2) := 0
-          currentSymbolAdderIn_I(3) := 0
-          currentSymbolAdderIn_Q(3) := 0
-
-          previousSymbolAdderIn_I(0) := gpReg(gpReg.length-1).I |>> 5 // divid by 32
-          previousSymbolAdderIn_Q(0) := gpReg(gpReg.length-1).Q |>> 5
-          previousSymbolAdderIn_I(1) := gpReg(gpReg.length-1).I |>> 3 // divid by 8
-          previousSymbolAdderIn_Q(1) := gpReg(gpReg.length-1).Q |>> 3
-          previousSymbolAdderIn_I(2) := gpReg(gpReg.length-1).I |>> 1 // divid by 2
-          previousSymbolAdderIn_Q(2) := gpReg(gpReg.length-1).Q |>> 1
-          previousSymbolAdderIn_I(3) := gpReg(gpReg.length-1).I |>> 2 // divid by 4
-          previousSymbolAdderIn_Q(3) := gpReg(gpReg.length-1).Q |>> 2
-        }
-        is(1){ //0.3455 for currentSymbol, 0.6545 for previousSymbol
-          currentSymbolAdderIn_I(0) := io.dataIn.data.I |>> 5 // divid by 32
-          currentSymbolAdderIn_Q(0) := io.dataIn.data.Q |>> 5
-          currentSymbolAdderIn_I(1) := io.dataIn.data.I |>> 4 // divid by 16
-          currentSymbolAdderIn_Q(1) := io.dataIn.data.Q |>> 4
-          currentSymbolAdderIn_I(2) := io.dataIn.data.I |>> 2 // divid by 4
-          currentSymbolAdderIn_Q(2) := io.dataIn.data.Q |>> 2
-          currentSymbolAdderIn_I(3) := 0
-          currentSymbolAdderIn_Q(3) := 0
-
-          previousSymbolAdderIn_I(0) := gpReg(gpReg.length-1).I |>> 5 // divid by 32
-          previousSymbolAdderIn_Q(0) := gpReg(gpReg.length-1).Q |>> 5
-          previousSymbolAdderIn_I(1) := gpReg(gpReg.length-1).I |>> 3 // divid by 8
-          previousSymbolAdderIn_Q(1) := gpReg(gpReg.length-1).Q |>> 3
-          previousSymbolAdderIn_I(2) := gpReg(gpReg.length-1).I |>> 1 // divid by 2
-          previousSymbolAdderIn_Q(2) := gpReg(gpReg.length-1).Q |>> 1
-          previousSymbolAdderIn_I(3) := 0
-          previousSymbolAdderIn_Q(3) := 0
-        }
-        is(2) { //0.6545 for currentSymbol, 0.3455 for previousSymbol
-          currentSymbolAdderIn_I(0) := io.dataIn.data.I |>> 5 // divid by 32
-          currentSymbolAdderIn_Q(0) := io.dataIn.data.Q |>> 5
-          currentSymbolAdderIn_I(1) := io.dataIn.data.I |>> 3 // divid by 8
-          currentSymbolAdderIn_Q(1) := io.dataIn.data.Q |>> 3
-          currentSymbolAdderIn_I(2) := io.dataIn.data.I |>> 1 // divid by 2
-          currentSymbolAdderIn_Q(2) := io.dataIn.data.Q |>> 1
-          currentSymbolAdderIn_I(3) := 0
-          currentSymbolAdderIn_Q(3) := 0
-
-          previousSymbolAdderIn_I(0) := gpReg(gpReg.length-1).I |>> 5 // divid by 32
-          previousSymbolAdderIn_Q(0) := gpReg(gpReg.length-1).Q |>> 5
-          previousSymbolAdderIn_I(1) := gpReg(gpReg.length-1).I |>> 4 // divid by 16
-          previousSymbolAdderIn_Q(1) := gpReg(gpReg.length-1).Q |>> 4
-          previousSymbolAdderIn_I(2) := gpReg(gpReg.length-1).I |>> 2 // divid by 4
-          previousSymbolAdderIn_Q(2) := gpReg(gpReg.length-1).Q |>> 2
-          previousSymbolAdderIn_I(3) := 0
-          previousSymbolAdderIn_Q(3) := 0
-        }
-        default{ //0.9045 for currentSymbol, 0.0955 for previousSymbol
-          currentSymbolAdderIn_I(0) := io.dataIn.data.I |>> 5 // divid by 32
-          currentSymbolAdderIn_Q(0) := io.dataIn.data.Q |>> 5
-          currentSymbolAdderIn_I(1) := io.dataIn.data.I |>> 3 // divid by 8
-          currentSymbolAdderIn_Q(1) := io.dataIn.data.Q |>> 3
-          currentSymbolAdderIn_I(2) := io.dataIn.data.I |>> 1 // divid by 2
-          currentSymbolAdderIn_Q(2) := io.dataIn.data.Q |>> 1
-          currentSymbolAdderIn_I(3) := io.dataIn.data.I |>> 2 // divid by 4
-          currentSymbolAdderIn_Q(3) := io.dataIn.data.Q |>> 2
-
-          previousSymbolAdderIn_I(0) := gpReg(gpReg.length-1).I |>> 5 // divid by 32
-          previousSymbolAdderIn_Q(0) := gpReg(gpReg.length-1).Q |>> 5
-          previousSymbolAdderIn_I(1) := gpReg(gpReg.length-1).I |>> 4 // divid by 16
-          previousSymbolAdderIn_Q(1) := gpReg(gpReg.length-1).Q |>> 4
-          previousSymbolAdderIn_I(2) := 0
-          previousSymbolAdderIn_Q(2) := 0
-          previousSymbolAdderIn_I(3) := 0
-          previousSymbolAdderIn_Q(3) := 0
-        }
-      }
-    } otherwise{
-      when(gpOutValid){
-        (currentSymbolAdderIn_Q(0),currentSymbolAdderIn_I(0)) := gpReg(gpReg.length-1)
-      } otherwise {
-        (currentSymbolAdderIn_Q(0),currentSymbolAdderIn_I(0)) := io.dataIn.data
-      }
-      for(index <- 1 until windowLen){
-        currentSymbolAdderIn_I(index) := 0
-        currentSymbolAdderIn_Q(index) := 0
-      }
-      for (index <- 0 until windowLen) {
-        previousSymbolAdderIn_I(index) := 0
-        previousSymbolAdderIn_Q(index) := 0
-      }
-    }
-
-    //output control
-    val validReg = Vec.fill(windowLen/2)(RegInit(False))
-    validReg(0) := io.dataIn.valid || gpOutValid
-    validReg(1) := validReg(0)
-
-    when(validReg(1)){
-      io.dataOut.data := windowingOut
-    } otherwise{
-      io.dataOut.data.I := 0
-      io.dataOut.data.Q := 0
-    }
-    io.dataOut.valid := validReg(1)
-  }
-
+  reorderOutValid := Mux(fsm.isActive(fsm.stateWrite), False, True)
+  io.dataOut.valid := reorderOutValid
+  io.dataOut.payload := reorderOut
 }
-*/
+

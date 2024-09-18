@@ -9,16 +9,9 @@ case class PilotInsert() extends Component{
   val io = new Bundle{
     val dataIn = slave(Stream(PunctInterleaverDataOutIF()))
     val dataOut = master(Stream(ButterflyDataIf(GlobalDefine().modulationDataOutWidth) ))
-    val newPackage = out(Bool())
   }
 
   def cntWidth : Int =  6
-
-  //default value
-  io.newPackage := False
-  when(io.dataIn.symbolType === GlobalDefine().legacySignalSymbol && (io.dataIn.fire)){
-    io.newPackage := True
-  }
 
   //instantiate modulation
   val modulator = Modulation()

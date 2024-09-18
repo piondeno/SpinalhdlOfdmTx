@@ -406,6 +406,9 @@ case class LoopFifo[T <: Data](val dataType: HardType[T], depth : Int, initFunc:
 // 但CsgFftRadix2Stage一旦計算完成 就要立即的資料輸出 所以後方的電路必須確保處於能夠即時接收來自CsgFftRadix2Stage的資料
 // 且接收過程不能有停頓，雖然CsgFftRadix2Stage的dataOut界面為Stream，但ready信號不起作用。
 // dataOut界面為Stream，只是為了方便多級CsgFftRadix2Stage的信號連接。
+// ex : 64 points FFT will need log2(64)=6 stages to complete operation.
+// stagePlan : 使用多個大階段實現FFT運算，stagePlan用來表示是這些大階段的第幾個
+// numStageCombined : 表示有多少個fft stages被整合到這個大階段中
 case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFactorWidth : Int, stagePlan : Int, numStageCombined : Int, forFFT : Boolean) extends Component{
   require(isPow2(fftPoints))
   var fftPower = log2Up(fftPoints)
@@ -416,6 +419,10 @@ case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFact
       val dataIn = slave(Stream(ButterflyDataIf(inputDataWidth)))
       val dataOut = master(Stream(ButterflyDataIf(inputDataWidth+numStageCombined)))
   }
+
+  //finalStage Check
+  var finalStageCheck = ((stagePlan * numStageCombined + numStageCombined) == fftPower)
+  println("finalStageCheck : " + finalStageCheck)
 
   //default input signal declare here to avoid errors
 
@@ -466,6 +473,7 @@ case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFact
 
   val fftAddr_Reg = Reg(Vec.fill(butterflyDelayValue)(cloneOf(fsmCnt)))
   val validTimingReg = Reg(Vec.fill(butterflyDelayValue)(Bool())) //pipeline timing control, delay chain
+  val outputEnable = Reg(Bool()) init(False)
   for(index <- 0 until validTimingReg.length){
     validTimingReg(index) init(False)
   }
@@ -484,12 +492,28 @@ case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFact
     }
   }
 
-  loopFifoEven.io.push := False
-  loopFifoOdd.io.push := False
-  when(validTimingReg(validTimingReg.length-1) && fftAddr_Reg(fftAddr_Reg.length-1).msb){
-    loopFifoEven.io.push := True
-    loopFifoOdd.io.push := True
+  val pushCond = validTimingReg(validTimingReg.length-1) && fftAddr_Reg(fftAddr_Reg.length-1).msb
+  if (finalStageCheck) {
+    loopFifoEven.io.push := pushCond && (~outputEnable)
+    loopFifoOdd.io.push := pushCond && (~outputEnable)
   }
+  else {
+    loopFifoEven.io.push := pushCond
+    loopFifoOdd.io.push := pushCond
+  }
+
+//  loopFifoEven.io.push := False
+//  loopFifoOdd.io.push := False
+//  when(validTimingReg(validTimingReg.length-1) && fftAddr_Reg(fftAddr_Reg.length-1).msb){
+//    if(finalStageCheck){
+//      loopFifoEven.io.push := True && (~outputEnable)
+//      loopFifoOdd.io.push := True && (~outputEnable)
+//    }
+//    else{
+//      loopFifoEven.io.push := True
+//      loopFifoOdd.io.push := True
+//    }
+//  }
 
   val fsm = new StateMachine{
     val stateInput : State = new State with EntryPoint{
@@ -545,10 +569,8 @@ case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFact
   val loopFifoPopDataMux = cloneOf(loopFifoEven.io.popData)
   val loopFifoPopDataAddr = UInt(fsmCnt.getBitsWidth bits)
 
-  //finalStage Check
-  var finalStageCheck = ((stagePlan*numStageCombined+numStageCombined) == fftPower)
-  println("finalStageCheck : "+finalStageCheck)
-  val outputEnable = Reg(Bool()) init(False)
+
+  //val outputEnable = Reg(Bool()) init(False)
   io.dataOut.valid := outputEnable
 
   val zeroOut = ButterflyDataIf(inputDataWidth+numStageCombined)
@@ -599,8 +621,13 @@ case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFact
     loopFifoEven.io.pop := loopFifoPopDataAddr.lsb ? False | True
     loopFifoOdd.io.pop := loopFifoPopDataAddr.lsb ? True | False
   } otherwise{
-    loopFifoEven.io.pop := (loopFifoPopDataAddr.lsb ? False | True) & outputEnable
-    loopFifoOdd.io.pop := (loopFifoPopDataAddr.lsb ? True | False) & outputEnable
+    if(finalStageCheck){
+      loopFifoEven.io.pop := False
+      loopFifoOdd.io.pop := False
+    } else{
+      loopFifoEven.io.pop := (loopFifoPopDataAddr.lsb ? False | True) & outputEnable
+      loopFifoOdd.io.pop := (loopFifoPopDataAddr.lsb ? True | False) & outputEnable
+    }
   }
 
   val ioInputResized = cloneOf(butterflyInput)
@@ -623,9 +650,13 @@ case class FftByCsgRadix2(fftPoints : Int, inputDataWidth : Int , rotationFactor
   val io = new Bundle {
     val dataIn = slave(Stream(ButterflyDataIf(inputDataWidth)))
     val dataOut = out(FftDataOutIf(inputDataWidth))
+    val giTypeIn = in(UInt(GlobalDefine().giTypeWidth bits))
+    val giTypeOut = out(UInt(GlobalDefine().giTypeWidth bits))
   }
   // To plan numStageCombined for each combined stages
-  var stageCombinePlan = Array(3,3)
+  //var stageCombinePlan = Array(3,3) //拆成兩個大階段，每大階段有3個fft stages
+  var stageCombinePlan = Array(6) //只使用一個大階段完成fft運算
+
   println("stageCombinePlan.sum: "+stageCombinePlan.sum)
   require(stageCombinePlan.sum == fftPower)
   val fftStages = for(stagePlan <- 0 until stageCombinePlan.length) yield{
@@ -663,6 +694,27 @@ case class FftByCsgRadix2(fftPoints : Int, inputDataWidth : Int , rotationFactor
   io.dataOut.data.bData.I := fftStages(fftStages.length - 1).io.dataOut.bData.I((validOutputWidth - 1) downto (validOutputWidth - 1 - (inputDataWidth - 1)))
   io.dataOut.data.bData.Q := fftStages(fftStages.length - 1).io.dataOut.bData.Q((validOutputWidth - 1) downto (validOutputWidth - 1 - (inputDataWidth - 1)))
   io.dataOut.valid := fftStages(fftStages.length - 1).io.dataOut.valid
+
+  //symbolTypeIn and symbolTypeOut control
+  val giTypeInRegAddr = Reg(UInt(1 bits))
+  val giTypeInReg = Vec.fill(2)(Reg(cloneOf(io.giTypeIn)))
+  io.giTypeOut := giTypeInReg(giTypeInRegAddr)
+  when(io.dataIn.fire.rise()){
+    when(io.giTypeIn === GlobalDefine().ltfGiType){
+      for(index <- 0 until giTypeInReg.length){
+        giTypeInReg(index) := GlobalDefine().ltfGiType
+      }
+      giTypeInRegAddr := 0
+    } otherwise{
+      giTypeInReg(0) := io.giTypeIn
+      giTypeInReg(1) := giTypeInReg(0)
+      giTypeInRegAddr := ~giTypeInRegAddr
+    }
+  }
+  when(io.dataOut.valid.fall()){
+    giTypeInRegAddr := ~giTypeInRegAddr
+  }
+
 }
 
 case class FftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFactorWidth : Int, stagePlan : Int) extends Component{
@@ -799,6 +851,8 @@ case class FftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFactorW
   // for avoid null assign for out signals
   io.dataOut.data := dataReg.data
 }
+
+
 /*
 *  以輸入位寬16 bit為列，BPSK最大值為2^14=16384，經過64點fft，資料會需要增加位寬5 bits，
 *  在加上所需的sign bit，大致上輸出需要位寬為20 bits。

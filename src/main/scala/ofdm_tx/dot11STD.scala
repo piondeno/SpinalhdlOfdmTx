@@ -34,10 +34,18 @@ case class GlobalDefine(){
   def modulatonDataInWidth : Int = 6  // 2^6 =64 QAM
   def modulationDataOutWidth : Int = 16
 
-  def legacySignalSymbol : Int = 0
-  def htSignalSymbol : Int = 1
-  def dataSymbol : Int = 2
-  def symbolTypeWidth : Int = 2
+
+  //sybmol type
+  def legacySignalSymbol    : Int = 0
+  def htSignalSymbol        : Int = 1
+  def dataSymbol            : Int = 2
+  def symbolTypeWidth       : Int = log2Up(dataSymbol+1)
+
+  //giType
+  def ltfGiType : Int = 0 // 1.6 us
+  def normalGiType : Int = 1 // 0.8 us
+  def shortGiType : Int = 2 // 0.4 us
+  def giTypeWidth : Int = log2Up(shortGiType+1)
 
   def rotationFactorWidth : Int = 18 // base on DSP48 structure
 }
