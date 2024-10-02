@@ -1,6 +1,5 @@
 package ofdm_tx
 
-import ofdm_tx.ButterflyDataIf.initNullFunc
 import ofdm_tx.ComplexDataType.{initRegFunc, setValueAsZero}
 import spinal.core._
 import spinal.lib._
@@ -299,7 +298,7 @@ case class ReorderIfftAndAddGi() extends Component {
   val memPostHalfOut = memPostHalf.readAsync(fsmCnt.resized)
   val reorderOut = cloneOf(io.dataIn.data.bData)
   val reorderOutZero = cloneOf(io.dataIn.data.bData)
-  val reorderOutValid = Bool()
+  val reorderOutValid = False
   val reorderOutMuxCondition = fsmCnt(writeAddr.getWidth)
   val reorderOutMux = Mux(reorderOutMuxCondition,memPostHalfOut,memPreHalfOut)
   setValueAsZero(reorderOutZero)
@@ -370,7 +369,6 @@ case class ReorderIfftAndAddGi() extends Component {
 
   }
 
-  reorderOutValid := Mux(fsm.isActive(fsm.stateWrite), False, True)
   io.dataOut.valid := reorderOutValid
   io.dataOut.payload := reorderOut
 }

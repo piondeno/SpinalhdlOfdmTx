@@ -2,8 +2,8 @@ package ofdm_tx
 
 import spinal.core._
 import spinal.lib._
-import spinal.lib.fsm._
-import spinal.core.sim._
+//import spinal.lib.fsm._
+//import spinal.core.sim._
 
 case class ConvolutionDataOutIf() extends Bundle{
   val data = Bits(2 bits)

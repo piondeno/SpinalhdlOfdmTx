@@ -12,7 +12,9 @@ case class Dot11STD() extends Enumeration{
 
 case class GlobalDefine(){
   def fftPoints : Int = 64
-  def mcsRateWidth : Int= 5
+  def parallelBusDataInWidth : Int = log2Up(64)
+  def plcpDataBytesLenWidth : Int = 16 // legacy is 12, ht is 16
+  def mcsRateWidth : Int = 4
   def nDBPSWidth : Int=log2Up(260) //MCS index=7, 64-QAM, 5/6 codeRate,
   def nBPSCWidth : Int=log2Up(6) //64QAM -> 6bits
   def nCBPSWidth : Int=log2Up(312) //MCS index=7, 64-QAM, 5/6 codeRate,
@@ -38,8 +40,9 @@ case class GlobalDefine(){
   //sybmol type
   def legacySignalSymbol    : Int = 0
   def htSignalSymbol        : Int = 1
-  def dataSymbol            : Int = 2
-  def symbolTypeWidth       : Int = log2Up(dataSymbol+1)
+  def legacyDataSymbol      : Int = 2
+  def htDataSymbol          : Int = 3
+  def symbolTypeWidth       : Int = log2Up(htDataSymbol+1)
 
   //giType
   def ltfGiType : Int = 0 // 1.6 us
@@ -48,4 +51,7 @@ case class GlobalDefine(){
   def giTypeWidth : Int = log2Up(shortGiType+1)
 
   def rotationFactorWidth : Int = 18 // base on DSP48 structure
+
+
+
 }

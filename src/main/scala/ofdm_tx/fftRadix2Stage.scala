@@ -1,6 +1,6 @@
 package ofdm_tx
 
-import ofdm_tx.ButterflyDataIf.initNullFunc
+import ofdm_tx.ButterflyDataIf.initZeroFunc
 import spinal.core._
 import spinal.lib._
 import spinal.core.sim._
@@ -39,7 +39,7 @@ object ButterflyDataIf{
   }
 
   // do not thing for initialization is not needed
-  def initNullFunc(x: ButterflyDataIf): Unit = {
+  def initZeroFunc(x: ButterflyDataIf): Unit = {
     x.aData.I := 0
     x.aData.Q := 0
     x.bData.I := 0
@@ -574,7 +574,7 @@ case class CsgFftRadix2Stage(fftPoints : Int, inputDataWidth : Int, rotationFact
   io.dataOut.valid := outputEnable
 
   val zeroOut = ButterflyDataIf(inputDataWidth+numStageCombined)
-  initNullFunc(zeroOut)
+  initZeroFunc(zeroOut)
 
   if(finalStageCheck){ //It will output signals without ready signal confirm. Beware...
     io.dataOut.payload := Mux(io.dataOut.valid, butterfly2Inst.io.dataOut, zeroOut)

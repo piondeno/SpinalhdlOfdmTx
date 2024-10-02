@@ -12,106 +12,142 @@ case class OfdmTx(DataInWidth : Int, DacWidth : Int) extends Component{
   }
   //noIoPrefix()
 
-  def pktTypePos : Int= 24
+  def pktTypePos : Int= 24 //in the testbench, the 24'th bit is usded to indicate package type
 
-  val dataInFire = io.dataIn.ready && io.dataIn.valid
-  val dataInReg = RegNextWhen(io.dataIn.payload,dataInFire)
+  val numSymbolTransmitted = Reg(UInt(log2Up(10) bits)) init(0)
+
+  // buffer the io.dataIn
+  val dataInReg = RegNextWhen(io.dataIn.payload,io.dataIn.fire)
+
+  // short train field timing control, STF
+  val stfDataOut = Flow(ComplexDataType(GlobalDefine().modulationDataOutWidth))
+  val stfGenArea = new Area {
+    val shortTrainFieldGenModule = ShortTrainFieldGen()
+    val trig = False
+    val nunRepeatRequre = cloneOf(shortTrainFieldGenModule.io.numRepeatRequire)  //legacy stf needs repeat 10 times
+    nunRepeatRequre := 9
+
+    shortTrainFieldGenModule.io.trig := trig
+    shortTrainFieldGenModule.io.numRepeatRequire := nunRepeatRequre
+
+    def setTrig() : Unit ={
+      trig := True
+    }
+    def assignNumRepeatRequreAssign(num : UInt) ={
+      nunRepeatRequre := num
+    }
+  }
+  stfDataOut := stfGenArea.shortTrainFieldGenModule.io.dataOut
+
 
   // State Machine control the flow ...
+  val ofdmTxReady = Bool()
   val currentSymbolMcsRate = Bits(GlobalDefine().mcsRateWidth bits)
-  val mcsRATE = B((B"01011"),GlobalDefine().mcsRateWidth bits)
+  val mcsRateReg = Reg(Bits(GlobalDefine().mcsRateWidth bits)) init(B"1011")
+  val numPlcpDataBytesLen = Reg(UInt(GlobalDefine().plcpDataBytesLenWidth bits))
   val symbolType = U(GlobalDefine().legacySignalSymbol,GlobalDefine().symbolTypeWidth bits)
-  val pktType = RegInit(False)
-  val p2sLen = U(64,log2Up(DataInWidth+1) bits)
-  val isDataSymbol = RegInit(False) // only data symble needs to be scrambled
+  val pktTypeReg = RegInit(False)
+  val numMinusOneBitsTranslateThisTime = UInt(GlobalDefine().parallelBusDataInWidth bits)
+  numMinusOneBitsTranslateThisTime := 23
 
   val mainFSM = new StateMachine{
+    setEncoding(binaryOneHot) // 比較複雜的狀態機，使用onehot code，可節省邏輯電路
     io.dataIn.ready := False
-    currentSymbolMcsRate := mcsRATE
+    currentSymbolMcsRate := mcsRateReg
 
     val stateIdle : State = new State with EntryPoint {
       whenIsActive{
         when(io.dataIn.valid){
-          goto(stateSTF)
+          stfGenArea.setTrig()
+          goto(stateLegacyLTF)
         }
       }
     }
-
-    val stateSTF : State = new State{
+    val stateLegacyLTF : State = new State{
       whenIsActive {
-        goto(stateLTF)
-      }
-    }
-
-    val stateLTF : State = new State{
-      whenIsActive(
-        when(io.dataIn.valid){
+        when(io.dataIn.valid && ofdmTxReady) {
           goto(stateLegacySig)
           io.dataIn.ready := True
-          p2sLen := 24
-          symbolType := GlobalDefine().legacySignalSymbol
-          isDataSymbol := False
-
-          switch(io.dataIn.payload(3 downto 0)){
-            is(B"1011"){mcsRATE := B"01011"}//  6 Mbps
-            is(B"1111"){mcsRATE := B"01111"}//  9 Mbps
-            is(B"1010"){mcsRATE := B"01010"}// 12 Mbps
-            is(B"1110"){mcsRATE := B"01110"}// 18 Mbps
-            is(B"1001"){mcsRATE := B"01001"}// 24 Mbps
-            is(B"1101"){mcsRATE := B"01101"}// 36 Mbps
-            is(B"1000"){mcsRATE := B"01000"}// 48 Mbps
-            is(B"1100"){mcsRATE := B"01100"}// 54 Mbps
-            default{    mcsRATE := B"01011"}//  6 Mbps
-          }
-          pktType := io.dataIn.payload(pktTypePos)
+          mcsRateReg := io.dataIn.payload(3 downto 0)
+          numPlcpDataBytesLen := io.dataIn.payload(16 downto 5).resized
+          pktTypeReg := io.dataIn.payload(pktTypePos) // it used to verify legacy or HT
         }
-      )
+      }
     }
     val stateLegacySig : State = new State {
-      whenIsActive(
-        currentSymbolMcsRate := B("1011").resize(GlobalDefine().mcsRateWidth)
-      )
+      onEntry{
+      }
+      whenIsActive {
+        currentSymbolMcsRate := B("1011")
+        symbolType := GlobalDefine().legacySignalSymbol
+
+        when(io.dataIn.valid && ofdmTxReady) {
+          io.dataIn.ready := True
+          when(pktTypeReg){
+            // because only implement one antenna and 20 MHz channel
+            // igore bit4 ~ bit6 of MCS field
+            mcsRateReg := io.dataIn.payload(3 downto 0)
+            numPlcpDataBytesLen := io.dataIn.payload(23 downto 8)
+            goto(stateHtSig)
+          } otherwise{
+            goto(stateLegacyData)
+          }
+        }
+      }
+    }
+    val stateLegacyData : State = new State{
+      whenIsActive{
+      }
+    }
+    val stateHtSig: State = new State {
+      whenIsActive {
+        currentSymbolMcsRate := B("1011")
+        symbolType := GlobalDefine().htSignalSymbol
+        numMinusOneBitsTranslateThisTime := 48-1
+
+        when(io.dataIn.valid && ofdmTxReady) {
+          //io.dataIn.ready := True
+          goto(stateHtStf)
+        }
+      }
+    }
+    val stateHtStf: State = new State {
+      whenIsActive {
+        stfGenArea.assignNumRepeatRequreAssign(4)  //for saving resource, numRepeatRequre is combination logic, need to be keeped
+        when((numSymbolTransmitted === 5).rise()){
+          stfGenArea.setTrig()
+        }
+        when(stfDataOut.valid.fall()){
+          goto(stateHtLTF)
+        }
+      }
+    }
+    val stateHtLTF: State = new State {
+      whenIsActive {
+        goto(stateHtData)
+      }
+    }
+    val stateHtData : State = new State{
+
     }
   }
 
-  // short train field timing control, STF
-  val stfOutputValid = Reg(Bool()) init(False)
-  val stfTimeCnt = Reg(UInt(log2Up(10) bits)) init(0)
-  val stfAddr = Reg(UInt(log2Up(16) bits)) init(0)
-  val stfTimeCntCond = (stfTimeCnt===9)
-  val stfAddrCond = (stfAddr===15)
-
-  when(mainFSM.isActive(mainFSM.stateSTF)){
-    stfOutputValid := True
-  } elsewhen(stfAddrCond && stfTimeCntCond){
-    stfOutputValid := False
+  // control numSymbolTransmitted
+  when(mainFSM.isActive(mainFSM.stateIdle)){
+    numSymbolTransmitted := 0
+  } elsewhen(io.dataOut.valid.fall()){
+    numSymbolTransmitted := numSymbolTransmitted + 1
   }
 
-  when(stfOutputValid){
-    stfAddr := stfAddr + 1
-  } otherwise{
-    stfAddr := 0
-  }
-
-  when(~stfOutputValid){
-    stfTimeCnt := 0
-  } elsewhen(stfAddrCond){
-    stfTimeCnt := stfTimeCnt+1
-  }
-
-  val stfDataOut = Flow(ComplexDataType(GlobalDefine().modulationDataOutWidth))
-  val legacyShortTrainRomModule = LegacyShortTrainRom()
-  legacyShortTrainRomModule.io.addr := stfAddr
-  stfDataOut.valid := stfOutputValid
-  stfDataOut.payload := legacyShortTrainRomModule.io.dataOut
 
   // Receive the data and parallel to serial
   val p2sModule = DataParallelToSerial(DataInWidth)
   p2sModule.io.parallelIn := io.dataIn.payload
   p2sModule.io.mcsRate := currentSymbolMcsRate
+  p2sModule.io.numMinusOneBitsTranslateThisTime := numMinusOneBitsTranslateThisTime
   p2sModule.io.trig := io.dataIn.ready
-  p2sModule.io.bitsLen := p2sLen
   p2sModule.io.symbolType := symbolType
+  ofdmTxReady := p2sModule.io.inIdle
 
   // Convolution
   val convModule = Convolution()
@@ -121,27 +157,28 @@ case class OfdmTx(DataInWidth : Int, DacWidth : Int) extends Component{
   val punctInterleaveModule = PunctInterleaver()
   punctInterleaveModule.io.dataIn <> convModule.io.serialOut
 
-
   //pilot and zero insert, modulator is in the pilotInsertModule
-  val pilotInsertModule = PilotInsert()
+  //val pilotInsertModule = PilotInsert()
+  val pilotInsertModule = PilotInsertV2()
   pilotInsertModule.io.dataIn <> punctInterleaveModule.io.dataOut
   //pilotInsertModule.io.dataOut.ready := pilotInsertModule.io.dataOut.valid
 
   //LTF gen
-  val legacyLongTrainSignalGenModule = LegacyLongTrainSignalGen()
-  legacyLongTrainSignalGenModule.io.trig := mainFSM.isActive(mainFSM.stateLTF)
+  val ltfGenModule = LongTrainSignalGen()
+  ltfGenModule.io.trig := mainFSM.isActive(mainFSM.stateLegacyLTF) || mainFSM.isActive(mainFSM.stateHtLTF)
+  ltfGenModule.io.isHtLtf := mainFSM.isActive(mainFSM.stateHtLTF)
 
   //instantiate IFFT
   val ifftModule = FftByCsgRadix2(64, GlobalDefine().modulationDataOutWidth, GlobalDefine().rotationFactorWidth, forFFT = false)
   //ifftModule.io.dataIn <> pilotInsertModule.io.dataOut
-  when(legacyLongTrainSignalGenModule.io.dataOut.valid){
-    ifftModule.io.dataIn <> legacyLongTrainSignalGenModule.io.dataOut
-    ifftModule.io.giTypeIn := GlobalDefine().ltfGiType
+  when(ltfGenModule.io.dataOut.valid){
+    ifftModule.io.dataIn <> ltfGenModule.io.dataOut
+    ifftModule.io.giTypeIn := ltfGenModule.io.giType
     pilotInsertModule.io.dataOut.ready := False
   } otherwise{
     ifftModule.io.dataIn <> pilotInsertModule.io.dataOut
     ifftModule.io.giTypeIn := GlobalDefine().normalGiType
-    legacyLongTrainSignalGenModule.io.dataOut.ready := False
+    ltfGenModule.io.dataOut.ready := False
   }
 
   //instantiate GpAndWindowing
@@ -150,13 +187,17 @@ case class OfdmTx(DataInWidth : Int, DacWidth : Int) extends Component{
   reorderIfftAndAddGiModule.io.giTypeIn := ifftModule.io.giTypeOut
 
   //io.dataOut assignment
-  io.dataOut := Mux(stfOutputValid, stfDataOut, reorderIfftAndAddGiModule.io.dataOut)
+  io.dataOut := Mux(stfDataOut.valid, stfDataOut, reorderIfftAndAddGiModule.io.dataOut)
 }
 
 
 object OfdmTx {
   def main(args: Array[String]) {
-    SpinalVerilog(OfdmTx(64,16)) //Or SpinalVerilog
+    SpinalConfig(
+      //nameWhenByFile = false,
+      genLineComments = true
+    ).generateVerilog(OfdmTx(64,16))
+    //SpinalVerilog(OfdmTx(64,16)) //Or SpinalVerilog
   }
 }
 
@@ -172,7 +213,12 @@ object OfdmTxSim {
       println(line)
     }
 
-    val spinalConfig = SpinalConfig(defaultClockDomainFrequency = FixedFrequency(10 MHz))
+    val spinalConfig = SpinalConfig(
+      nameWhenByFile = false,
+      rtlHeader = "By Ryan",
+      headerWithDate = true,
+      genLineComments = true,
+      defaultClockDomainFrequency = FixedFrequency(10 MHz))
     SimConfig
       .withConfig(spinalConfig)
       .withWave
@@ -189,7 +235,8 @@ object OfdmTxSim {
         dut.clockDomain.deassertReset()
 
         var index = 0
-        while(index < lines.length){
+        //while(index < lines.length){
+        while(index < 2){
           if(dut.io.dataIn.ready.toBoolean == true){
             index = index + 1
           }
@@ -200,7 +247,7 @@ object OfdmTxSim {
 
         dut.clockDomain.waitSampling(10)
         //dut.convModule.io.serialOut.ready #= true
-        dut.clockDomain.waitSampling(1000)
+        dut.clockDomain.waitSampling(1500)
         println("Simulation done")
         //println(GlobalDefine().amplitude_64QAM)
         simSuccess()

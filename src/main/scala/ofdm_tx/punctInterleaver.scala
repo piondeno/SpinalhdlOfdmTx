@@ -4,6 +4,7 @@ import spinal.core.{IntToBuilder, _}
 import spinal.lib._
 import spinal.core.sim._
 import spinal.lib.fsm._
+import scala.math.pow
 
 case class PunctInterleaverDataOutIF() extends Bundle{
   val data = Bits(GlobalDefine().modulatonDataInWidth bits)
@@ -20,11 +21,12 @@ case class PunctInterleaver() extends Component{
 
   // state machine
   val fsm = new StateMachine{
-    var cntInitValueNot = U(0,GlobalDefine().nDBPSWidth bits)
-    val cnt = RegInit(~cntInitValueNot)
-    val nDBPS = RegInit(U(24,GlobalDefine().nDBPSWidth bits))
-    val nCBPS = RegInit(U(48,GlobalDefine().nCBPSWidth bits))
-    val nBPSC = RegInit(U(1,GlobalDefine().nBPSCWidth bits))
+    //var cntInitValueNot = U(0,GlobalDefine().nDBPSWidth bits)
+    //val cnt = RegInit(U(pow(2,GlobalDefine().nDBPSWidth).intValue - 1), GlobalDefine().nDBPSWidth bits)
+    val cnt = Reg(UInt(GlobalDefine().nDBPSWidth bits)) init(pow(2,GlobalDefine().nDBPSWidth).intValue - 1)
+    val nDBPS = RegInit(U(24,GlobalDefine().nDBPSWidth bits)) //Data bits per OFDM Symbol
+    val nCBPS = RegInit(U(48,GlobalDefine().nCBPSWidth bits)) //Coded bits per OFDM Symbol
+    val nBPSC = RegInit(U(1,GlobalDefine().nBPSCWidth bits)) // bits per subcarrier
     val symbolTypeReg = RegInit(U(GlobalDefine().legacySignalSymbol,GlobalDefine().symbolTypeWidth bits))
     //val mcsRateReg = RegInit(B("1011").resize(GlobalDefine().mcsRateWidth))
 
@@ -130,18 +132,20 @@ case class PunctInterleaver() extends Component{
           interleaverRamAddr(index) := interleaverColAddr
         }
 
-        when(io.dataOut.ready){
+        when(io.dataOut.fire){
           when(interleaverRowAddr === (GlobalDefine().nInterleaverSingleRamNum / GlobalDefine().modulatonDataInWidth - 1)) {
             interleaverRowAddr := 0
             interleaverColAddr := interleaverColAddr + 1
           } otherwise {
             interleaverRowAddr := interleaverRowAddr + 1
           }
+
+          when((interleaverRowAddr === 2) && (interleaverColAddr === (GlobalDefine().interleaverSingleRamDepth - 1))) {
+            goto(stateIdle)
+          }
+
         }
 
-        when((interleaverRowAddr === 2) && (interleaverColAddr === (GlobalDefine().interleaverSingleRamDepth-1))){
-          goto(stateIdle)
-        }
       }
     }
   }
